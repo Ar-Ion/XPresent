@@ -6,6 +6,7 @@ import subprocess as sp
 import time
 from datetime import datetime
 import pickle
+import threading
 
 font = cv2.FONT_HERSHEY_COMPLEX
 
@@ -14,6 +15,80 @@ keys = [0]
 direction = 1
 currentKey = 0
 startTime = None
+outputFrame = []
+encodedFrame = []
+
+def ffplay():
+    playback = ['ffplay',
+        '-probesize',
+        '32',
+        '-analyzeduration',
+        '0',
+        '-fflags',
+        'nobuffer',
+        '-fflags',
+        'discardcorrupt',
+        '-flags',
+        'low_delay',
+        '-sync',
+        'ext',
+        '-framedrop',
+        '-avioflags',
+        'direct',
+        '-protocol_whitelist',
+        'file,rtp,udp',
+        '-i',
+        'presentation.sdp']
+    playbackProcess = sp.Popen(playback)
+
+def encode():
+    global outputFrame
+    global encodedFrame
+
+    while True:
+        if len(outputFrame) > 0:
+            (state, encoded) = cv2.imencode('.bmp', outputFrame)
+
+            if state == True:
+                encodedFrame = encoded
+
+def ffmpeg():
+    global encodedFrame
+
+    stream = ['ffmpeg',
+       '-re',
+       '-s', sys.argv[3],
+       '-i', '-',
+       '-pix_fmt', 'yuv420p',
+       '-r', '30',  # output fps
+       '-g', '50',
+       '-c:v', 'libx264',
+       '-b:v', '2M',
+       '-bufsize', '64M',
+       '-maxrate', "4M",
+       '-preset', 'veryfast',
+       '-rtsp_transport', 'tcp',
+       '-segment_times', '5',
+       '-tune',
+       'zerolatency',
+       '-sdp_file',
+       'presentation.sdp',
+       '-f', 'rtp',
+       'rtp://localhost:1234']
+    streamProcess = sp.Popen(stream, stdin=sp.PIPE, bufsize=1920*1080*3)
+
+    while True:
+        lastUpdate = time.time()
+
+        if len(encodedFrame) > 0:
+            streamProcess.stdin.write(encodedFrame.tobytes())
+
+            delta = time.time() - lastUpdate
+
+            if delta < 0.03:
+                time.sleep(0.03 - delta)
+
+            lastUpdate = time.time()
 
 # Returns the relative next frame id
 def editorController(event, currentFrame):
@@ -82,9 +157,11 @@ def presentationController(event, currentFrame):
         return direction
 
 def viewer(capture, controller, resolution, fps, stream):
+    global outputFrame
+
     cv2.namedWindow("Presentation", cv2.WINDOW_NORMAL)
 
-    (width, height) = resolution
+    (width, height) = (1080, 720)
     currentFrame = 0
 
     lastUpdate = datetime.now()
@@ -93,7 +170,7 @@ def viewer(capture, controller, resolution, fps, stream):
     (state, frame) = capture.read()
 
     while capture.isOpened():
-        event = cv2.waitKey(timeBetweenUpdates // 2) & 0xFF
+        event = cv2.waitKey(timeBetweenUpdates) & 0xFF
         nextFrame = controller(event, currentFrame)
 
         currentFrame = currentFrame + nextFrame
@@ -103,29 +180,21 @@ def viewer(capture, controller, resolution, fps, stream):
 
 
         if nextFrame != 0:
-            if 1000*(datetime.now() - lastUpdate).total_seconds() < timeBetweenUpdates:
-                lastUpdate = datetime.now()
-                (state, frame) = capture.read()
-            else:
-                lastUpdate = datetime.now()
-
             if nextFrame != 1:
                 capture.set(cv2.CAP_PROP_POS_FRAMES, currentFrame);
+
+            (state, frame) = capture.read()
 
         if state == True:
             frame_width = width
             frame_height = round(frame.shape[0] * width / frame.shape[1])
             border_height = round((height - frame_height) / 2)
 
-            frame = cv2.resize(frame, (frame_width, frame_height), interpolation=cv2.INTER_AREA)
+            #frame = cv2.resize(frame, (frame_width, frame_height), interpolation=cv2.INTER_AREA)
 
-            if stream != None:
-                (state, encoded) = cv2.imencode('.png', frame)
+            outputFrame = frame
 
-                if state == True:
-                    stream.stdin.write(encoded.tobytes())
-
-            presenterFrame = cv2.resize(frame, resolution, interpolation=cv2.INTER_AREA)
+            presenterFrame = cv2.resize(frame, (frame_width, frame_height), interpolation=cv2.INTER_AREA)
             presenterFrame = cv2.copyMakeBorder(presenterFrame, border_height, border_height, 0, 0, cv2.BORDER_CONSTANT)
 
             videoTime = str(int(currentFrame / fps / 60)) + "m " + str(int(currentFrame / fps % 60)) + "s"
@@ -145,6 +214,7 @@ def viewer(capture, controller, resolution, fps, stream):
     capture.release()
     cv2.destroyAllWindows()
 
+
 if __name__ == "__main__":
     if len(sys.argv) > 3:
         video = sys.argv[2]
@@ -157,9 +227,10 @@ if __name__ == "__main__":
 
             if os.path.isfile(video):
                 capture = cv2.VideoCapture(video)
-                fps = capture.get(cv2.CAP_PROP_FPS)
 
                 if capture.isOpened():
+                    fps = capture.get(cv2.CAP_PROP_FPS)
+                    capture.set(cv2.CAP_PROP_BUFFERSIZE, 8)
 
                     try:
                         keyFile = video + ".keys"
@@ -168,52 +239,12 @@ if __name__ == "__main__":
                         keys = [0]
 
                     if sys.argv[1] == "-p":
-                        stream = ['ffmpeg',
-                           '-re',
-                           '-s', sys.argv[3],
-                           '-r', str(fps),  # rtsp fps (from input server)
-                           '-i', '-',
-                           '-pix_fmt', 'yuv420p',
-                           '-r', '30',  # output fps
-                           '-g', '50',
-                           '-c:v', 'libx264',
-                           '-b:v', '2M',
-                           '-bufsize', '64M',
-                           '-maxrate', "4M",
-                           '-preset', 'veryfast',
-                           '-rtsp_transport', 'tcp',
-                           '-segment_times', '5',
-                           '-tune',
-                           'zerolatency',
-                           '-sdp_file',
-                           'presentation.sdp',
-                           '-f', 'rtp',
-                           'rtp://localhost:1234']
-                        streamProcess = sp.Popen(stream, stdin=sp.PIPE)
 
-                        playback = ['ffplay',
-                            '-probesize',
-                            '32',
-                            '-analyzeduration',
-                            '0',
-                            '-fflags',
-                            'nobuffer',
-                            '-fflags',
-                            'discardcorrupt',
-                            '-flags',
-                            'low_delay',
-                            '-sync',
-                            'ext',
-                            '-framedrop',
-                            '-avioflags',
-                            'direct',
-                            '-protocol_whitelist',
-                            'file,rtp,udp',
-                            '-i',
-                            'presentation.sdp']
-                        playbackProcess = sp.Popen(playback)
+                        threading.Thread(target=encode).start()
+                        threading.Thread(target=ffmpeg).start()
+                        threading.Thread(target=ffplay).start()
 
-                        viewer(capture, presentationController, resolution, fps, streamProcess)
+                        viewer(capture, presentationController, resolution, fps, None)
 
                         sys.exit(0)
                     elif sys.argv[1] == "-e":
